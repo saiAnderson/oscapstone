@@ -1,0 +1,18 @@
+# Build directories
+**/build/
+
+# Compiled object files
+*.o
+
+# Linked kernel files
+*.elf
+*.img
+*.map
+
+# Editor files
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
