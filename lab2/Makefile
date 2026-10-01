@@ -74,8 +74,8 @@ BOOT_OBJS := $(BOOT_BUILD_DIR)/boot.o \
 			 $(BOOT_BUILD_DIR)/uart.o 
 
 BOOT_ELF := $(BOOT_BUILD_DIR)/bootloader.elf
-BOOT_IMG := $(BOOT_BUILD_DIR)/bootloader.img 
-BOOT_MAP := $(BOOT_BUILD_DIR)/bootloader.map 
+BOOT_IMG := $(BOOT_BUILD_DIR)/bootloader.img
+BOOT_MAP := $(BOOT_BUILD_DIR)/bootloader.map
 
 # ============================================================
 # Kernel objects and outputs
@@ -215,7 +215,7 @@ $(KERNEL_IMG): $(KERNEL_ELF)
 run: $(BOOT_IMG)
 	$(QEMU) \
 		-M raspi3b \
-		-kernel $(BOOT_IMG) \
+		-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
 		-display none \
 		-serial null \
 		-serial pty

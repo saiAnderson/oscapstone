@@ -6,7 +6,7 @@ SECTIONS
   * bootloader 預期載入位置。
   */
   . = 0x60000;
-  __kernel_start = .;
+  __bootloader_start = .;
 
 
   /*
@@ -61,5 +61,5 @@ SECTIONS
     __stack_top = .;
   }
 
-  __kernel_end = .;
+  __bootloader_end = .;
 }
