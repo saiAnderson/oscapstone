@@ -2,6 +2,10 @@
 #define CPIO_H 
 
 void cpio_test(void);
+unsigned int hex_to_uint(const char *s, int len);
+unsigned long align4(unsigned long addr);
+void cpio_list(void);
+
 
 struct cpio_newc_header {
     char c_magic[6];

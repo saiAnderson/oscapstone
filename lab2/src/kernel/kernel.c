@@ -8,8 +8,10 @@ void kernel_main(void)
 {
     uart_init();
     uart_puts("Welcome to my shell!\n");
-    cpio_test();
+    cpio_list();
     HardwareInfo info;
+    uart_puts("mailbox TEST\r\n");
+    uart_puts("==================================\r\n");
     if(get_hardware_info(&info)){
         uart_puts("Board revision: ");
         uart_hex(info.board_revision);
@@ -25,6 +27,7 @@ void kernel_main(void)
     else {
         uart_puts("Mailbox request failed\r\n");
     }
+    uart_puts("==================================\r\n");
     
     shell_run();
 }
