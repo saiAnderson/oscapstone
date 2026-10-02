@@ -24,6 +24,10 @@ KERNEL_SRC_DIR := $(SRC_DIR)/kernel
 BOOT_BUILD_DIR   := $(BUILD_DIR)/bootloader
 KERNEL_BUILD_DIR := $(BUILD_DIR)/kernel
 
+# QEMU 每次啟動時可能取得不同的 /dev/pts/N
+SHELL := /bin/bash
+UART_PTY_FILE := $(BUILD_DIR)/uart_pty.txt
+PTY_CAPTURE   := tools/capture_pty.sh
 
 # ============================================================
 # Compiler flags
@@ -213,12 +217,25 @@ $(KERNEL_IMG): $(KERNEL_ELF)
 # ============================================================
 
 run: $(BOOT_IMG)
+	rm -f $(UART_PTY_FILE)
 	$(QEMU) \
 		-M raspi3b \
 		-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
 		-display none \
 		-serial null \
-		-serial pty
+		-serial pty \
+		2>&1 | $(PTY_CAPTURE) $(UART_PTY_FILE)
+
+# 將目前 terminal 與 QEMU 的 UART PTY 做雙向連接，
+# rawer 關閉 terminal 的字元處理與 echo，Ctrl+O (0x0f) 用來離開 socat。
+# Connect the current terminal to QEMU UART.
+# Ctrl+O is used to exit socat.
+run-socat:
+	@test -f $(UART_PTY_FILE) || \
+		(echo "PTY file not found. Run 'make run' first."; exit 1)
+	@UART_PTY=$$(cat $(UART_PTY_FILE)); \
+		echo "Connect to $$UART_PTY"; \
+		socat -,rawer,escape=0x0f $$UART_PTY,rawer
 
 # ============================================================
 # Inspection
