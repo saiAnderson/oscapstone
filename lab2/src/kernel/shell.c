@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "uart.h"
 #include "shell.h"
+#define BOOTLOADER_ADD 0x60000
 
 char buffer[128];
 static unsigned int index;
@@ -14,6 +15,15 @@ static int str_equal(char *s1, char *s2){
         s2++;
     }
     return (*s1=='\0'&&*s2=='\0');
+}
+
+static void reboot(void){
+    void (*bootloader) (void) = (void (*)(void)) BOOTLOADER_ADD;
+    bootloader();
+
+    // for 保險不小心回來後繼續跑舊的 kernel
+    while(1){
+    }
 }
 
 void shell_run(void){
@@ -37,10 +47,14 @@ void shell_run(void){
                 // string comepare 
                 // if exit command 
                 if(str_equal("help", buffer)){
-                    uart_puts("help : print this help menu \nhello : Hello World!"); 
+                    uart_puts("help : print this help menu \nhello : Hello World!\nreboot : Rebooting to bootloader"); 
                 }
                 else if(str_equal("hello" ,buffer)){
                     uart_puts("Hello World!");
+                }
+                else if(str_equal("reboot" ,buffer)){
+                    uart_puts("Rebooting to bootloader...");
+                    reboot();
                 }
                 // not exit command
                 else {

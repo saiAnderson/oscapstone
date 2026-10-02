@@ -75,7 +75,7 @@ KERNEL_LINKER_SCRIPT := $(LINKER_DIR)/kernel.ld
 
 BOOT_OBJS := $(BOOT_BUILD_DIR)/boot.o \
 			 $(BOOT_BUILD_DIR)/main.o \
-			 $(BOOT_BUILD_DIR)/uart.o 
+			 $(BOOT_BUILD_DIR)/uart.o
 
 BOOT_ELF := $(BOOT_BUILD_DIR)/bootloader.elf
 BOOT_IMG := $(BOOT_BUILD_DIR)/bootloader.img
@@ -89,7 +89,8 @@ KERNEL_OBJS := $(KERNEL_BUILD_DIR)/boot.o \
                $(KERNEL_BUILD_DIR)/kernel.o \
                $(KERNEL_BUILD_DIR)/uart.o \
                $(KERNEL_BUILD_DIR)/shell.o \
-               $(KERNEL_BUILD_DIR)/mailbox.o
+               $(KERNEL_BUILD_DIR)/mailbox.o \
+			   $(KERNEL_BUILD_DIR)/cpio.o
 
 KERNEL_ELF := $(KERNEL_BUILD_DIR)/kernel8.elf
 KERNEL_IMG := $(KERNEL_BUILD_DIR)/kernel8.img
@@ -171,6 +172,7 @@ $(KERNEL_BUILD_DIR)/kernel.o: \
 	$(INCLUDE_DIR)/uart.h \
 	$(INCLUDE_DIR)/shell.h \
 	$(INCLUDE_DIR)/mailbox.h \
+	$(INCLUDE_DIR)/cpio.h \
 	| $(KERNEL_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -196,6 +198,12 @@ $(KERNEL_BUILD_DIR)/mailbox.o: \
 	| $(KERNEL_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# src/kernel/cpio.c -> build/kernel/cpio.o
+$(KERNEL_BUILD_DIR)/cpio.o: \
+	$(KERNEL_SRC_DIR)/cpio.c \
+	$(INCLUDE_DIR)/cpio.h \
+	| $(KERNEL_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # ============================================================
 # Kernel linking
@@ -216,10 +224,12 @@ $(KERNEL_IMG): $(KERNEL_ELF)
 # QEMU
 # ============================================================
 
+# 使用 uart bootloader load kernel8.img 
 run: $(BOOT_IMG)
 	rm -f $(UART_PTY_FILE)
 	$(QEMU) \
 		-M raspi3b \
+		-device loader,file=initramfs.cpio,addr=0x08000000,force-raw=on \
 		-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
 		-display none \
 		-serial null \

@@ -1,12 +1,14 @@
 #include "uart.h"
 #include "shell.h"
 #include "mailbox.h"
+#include "cpio.h"
 #include <stddef.h>
 
 void kernel_main(void)
 {
     uart_init();
     uart_puts("Welcome to my shell!\n");
+    cpio_test();
     HardwareInfo info;
     if(get_hardware_info(&info)){
         uart_puts("Board revision: ");
