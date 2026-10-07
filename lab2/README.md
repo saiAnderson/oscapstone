@@ -1696,3 +1696,1505 @@ interactive kernel shell
 因此已完成 UART Bootloader 的核心流程：
 
 > **在不重新直接載入 kernel image 的情況下，先執行固定 bootloader，再透過 UART 將新的 kernel image 傳入 RAM 並執行。**
+
+# Basic Exercise 3 - Initial Ramdisk
+
+## 目標
+
+這個 Exercise 的目標是理解 **Kernel 在尚未具備完整 storage driver / filesystem 的情況下，如何先取得開機階段需要的檔案**。
+
+本實作使用：
+
+```text
+CPIO newc archive
+```
+
+將多個檔案打包成：
+
+```text
+initramfs.cpio
+```
+
+並讓 QEMU 預先把 CPIO archive 放進 RAM。
+
+Kernel 啟動之後，不需要先存取 SD card，而是直接解析 RAM 裡的 CPIO archive。
+
+本 Exercise 最後需要做到：
+
+```text
+CPIO archive
+      ↓
+解析 Header
+      ↓
+取得 filename / filesize
+      ↓
+找到 file data
+      ↓
+走訪所有檔案
+      ↓
+根據 pathname 找到指定檔案
+```
+
+---
+
+# 1. 為什麼需要 Initial Ramdisk？
+
+Kernel 啟動之後，如果想直接讀：
+
+```text
+SD Card / Disk
+```
+
+需要先具備：
+
+```text
+Storage Driver
+      ↓
+Block Device
+      ↓
+Filesystem
+      ↓
+File
+```
+
+例如：
+
+```text
+Kernel
+  ↓
+SD Driver
+  ↓
+SD Card
+  ↓
+Filesystem
+  ↓
+hello.txt
+```
+
+但是在 Kernel 剛啟動的 early boot 階段，這些功能可能還沒有完成。
+
+因此可以先讓 boot firmware / QEMU：
+
+```text
+把必要的檔案
+      ↓
+先放進 RAM
+```
+
+Kernel 就可以：
+
+```text
+Kernel
+  ↓
+直接讀 RAM
+  ↓
+initramfs.cpio
+```
+
+而不需要先完成 SD card driver。
+
+---
+
+# 2. 為什麼 boot firmware 可以讀 SD card？
+
+讀 SD card 並不是「不需要 driver」。
+
+差別在於：
+
+```text
+開機階段
+→ Boot ROM / Boot Firmware 自己具有讀 boot device 的能力
+
+Kernel 執行階段
+→ Kernel 需要自己的 storage driver
+```
+
+實體 Raspberry Pi 3 的概念：
+
+```text
+Power On
+   ↓
+Boot ROM
+   ↓
+bootcode.bin
+   ↓
+start.elf / firmware
+   ↓
+讀 SD Card boot partition
+   ↓
+載入 Kernel / initramfs
+   ↓
+放進 RAM
+   ↓
+啟動 Kernel
+```
+
+所以：
+
+```text
+kernel8.img
+initramfs.cpio
+```
+
+原本可以都放在 SD card 的 boot partition。
+
+Kernel 開始執行之前，firmware 已經先把它們搬進 RAM。
+
+---
+
+# 3. UART Bootloader 與 Initramfs
+
+目前專案使用自製 UART bootloader：
+
+```text
+0x60000
+UART Bootloader
+      ↓
+UART 接收 kernel8.img
+      ↓
+0x80000
+Kernel
+```
+
+因此目前 QEMU memory layout 可以理解成：
+
+```text
+RAM
+
+0x00060000
+┌─────────────────────┐
+│ UART Bootloader     │
+└─────────────────────┘
+
+0x00080000
+┌─────────────────────┐
+│ kernel8.img         │
+└─────────────────────┘
+
+0x08000000
+┌─────────────────────┐
+│ initramfs.cpio      │
+└─────────────────────┘
+```
+
+---
+
+# 4. QEMU 載入 CPIO
+
+Lab 原本使用：
+
+```bash
+-initrd initramfs.cpio
+```
+
+並且 QEMU 預設將 CPIO archive 放到：
+
+```text
+0x08000000
+```
+
+但是目前 UART bootloader 使用：
+
+```bash
+-device loader,file=...,addr=0x60000
+```
+
+而不是：
+
+```bash
+-kernel
+```
+
+因此 QEMU 會出現：
+
+```text
+-initrd only allowed with -kernel option
+```
+
+所以改成直接使用 generic loader：
+
+```bash
+-device loader,file=initramfs.cpio,addr=0x08000000,force-raw=on
+```
+
+注意這個 loader 不指定：
+
+```text
+cpu-num
+```
+
+因為 initramfs 只是資料，不是要執行的程式。
+
+---
+
+# 5. 建立 CPIO Archive
+
+先建立：
+
+```text
+rootfs/
+├── hello.txt
+└── test.txt
+```
+
+例如：
+
+```text
+hello.txt
+→ Hello from initramfs!
+
+test.txt
+→ This is a test file.
+```
+
+建立 `newc` 格式 archive：
+
+```bash
+cd rootfs
+find . | cpio -o -H newc > ../initramfs.cpio
+cd ..
+```
+
+檢查 archive：
+
+```bash
+cpio -it < initramfs.cpio
+```
+
+範例輸出：
+
+```text
+.
+hello.txt
+test.txt
+2 blocks
+```
+
+代表 CPIO archive 已成功建立。
+
+---
+
+# 6. CPIO newc 的資料格式
+
+CPIO 並不是單純：
+
+```text
+[header][data]
+[header][data]
+```
+
+每一個 entry 的格式是：
+
+```text
+[Header]
+[Filename]
+[Padding]
+[File Data]
+[Padding]
+```
+
+然後才接下一個 entry：
+
+```text
+Entry 1
+[Header][Filename][Padding][Data][Padding]
+
+Entry 2
+[Header][Filename][Padding][Data][Padding]
+
+Entry 3
+...
+```
+
+完整概念：
+
+```text
+Header
+  ↓
+Filename
+  ↓
+Align 4
+  ↓
+File Data
+  ↓
+Align 4
+  ↓
+Next Header
+```
+
+---
+
+# 7. CPIO Header
+
+`newc` header：
+
+```c
+struct cpio_newc_header {
+    char c_magic[6];
+    char c_ino[8];
+    char c_mode[8];
+    char c_uid[8];
+    char c_gid[8];
+    char c_nlink[8];
+    char c_mtime[8];
+    char c_filesize[8];
+    char c_devmajor[8];
+    char c_devminor[8];
+    char c_rdevmajor[8];
+    char c_rdevminor[8];
+    char c_namesize[8];
+    char c_check[8];
+};
+```
+
+大小：
+
+```text
+6 + 13 × 8
+= 110 bytes
+```
+
+目前主要使用：
+
+```text
+c_magic
+c_namesize
+c_filesize
+```
+
+---
+
+# 8. Magic Number
+
+`newc` CPIO 的 magic：
+
+```text
+070701
+```
+
+因此可以先測試：
+
+```c
+struct cpio_newc_header *header =
+    (struct cpio_newc_header *)0x08000000;
+```
+
+印出：
+
+```c
+for (int i = 0; i < 6; i++) {
+    uart_send(header->c_magic[i]);
+}
+```
+
+成功輸出：
+
+```text
+070701
+```
+
+代表：
+
+```text
+QEMU 成功載入 initramfs.cpio
++
+0x08000000 確實是 CPIO Header
+```
+
+不能直接：
+
+```c
+uart_puts(header->c_magic);
+```
+
+因為：
+
+```c
+char c_magic[6];
+```
+
+沒有保證後面有：
+
+```text
+'\0'
+```
+
+`uart_puts()` 會持續往後讀，造成：
+
+```text
+0707010000A813000041ED...
+```
+
+---
+
+# 9. 為什麼 Header 裡的數字需要 hex_to_uint？
+
+`newc` 格式中的數字不是 binary integer。
+
+例如：
+
+```c
+char c_filesize[8];
+```
+
+裡面可能是 ASCII：
+
+```text
+0000001A
+```
+
+代表：
+
+```text
+0x1A
+= 26
+```
+
+所以需要自己把 ASCII hexadecimal 轉成 integer。
+
+實作：
+
+```c
+unsigned int hex_to_uint(const char *s, int len)
+{
+    unsigned int sum = 0;
+
+    for (int i = 0; i < len; i++) {
+        sum <<= 4;
+
+        sum += ('A' <= s[i] && s[i] <= 'F')
+            ? (s[i] - 'A' + 10)
+            : (s[i] - '0');
+    }
+
+    return sum;
+}
+```
+
+概念：
+
+```text
+"1A"
+
+1
+↓ × 16
+16
+↓ + 10
+26
+```
+
+---
+
+# 10. 為什麼需要 align4？
+
+`newc` CPIO 規定資料需要按照 4-byte boundary 排列。
+
+因此：
+
+```text
+filename 結束
+↓
+補 padding
+↓
+下一個 4-byte aligned address
+↓
+File Data
+```
+
+同樣：
+
+```text
+File Data 結束
+↓
+補 padding
+↓
+下一個 Header
+```
+
+實作：
+
+```c
+unsigned long align4(unsigned long n)
+{
+    return (n + 3) & ~3UL;
+}
+```
+
+例如：
+
+```text
+align4(116) = 116
+align4(117) = 120
+align4(118) = 120
+align4(119) = 120
+align4(120) = 120
+```
+
+注意：
+
+不是：
+
+```c
+filesize = align4(filesize);
+```
+
+而是對 **下一個 address** 做 alignment：
+
+```text
+data address
++
+filesize
+↓
+align4
+↓
+next header address
+```
+
+---
+
+# 11. Pointer Arithmetic
+
+這裡需要注意 pointer 和 integer address 的差別。
+
+例如：
+
+```c
+char *ptr;
+ptr + 1;
+```
+
+因為：
+
+```text
+sizeof(char) = 1
+```
+
+所以前進：
+
+```text
+1 byte
+```
+
+但是：
+
+```c
+struct cpio_newc_header *header;
+header + 1;
+```
+
+會前進：
+
+```text
+sizeof(struct cpio_newc_header)
+= 110 bytes
+```
+
+如果：
+
+```c
+(unsigned long)header
+```
+
+它已經不是 pointer，而是單純的 address 數值。
+
+所以：
+
+```c
+(unsigned long)header + 110
+```
+
+就是：
+
+```text
+address + 110 bytes
+```
+
+不會乘上：
+
+```text
+sizeof(unsigned long)
+```
+
+---
+
+# 12. 找到 Filename
+
+因為 CPIO 規格定義：
+
+```text
+Header
+↓
+Filename
+```
+
+所以：
+
+```c
+char *filename =
+    (char *)header + sizeof(struct cpio_newc_header);
+```
+
+`c_namesize` 告訴我們 filename 的長度：
+
+```c
+unsigned int namesize =
+    hex_to_uint(header->c_namesize, 8);
+```
+
+注意：
+
+```text
+namesize 包含最後的 '\0'
+```
+
+例如：
+
+```text
+hello.txt\0
+```
+
+總長：
+
+```text
+10 bytes
+```
+
+---
+
+# 13. 找到 File Data
+
+File Data 位在：
+
+```text
+Header
++
+Header Size
++
+Filename Size
++
+Padding
+```
+
+所以：
+
+```c
+char *fileDataPtr = (char *)align4(
+    (unsigned long)header
+    + sizeof(struct cpio_newc_header)
+    + namesize
+);
+```
+
+可以理解成：
+
+```text
+Header Address
+      +
+110 bytes
+      +
+namesize
+      ↓
+Filename 結尾
+      ↓
+align4()
+      ↓
+File Data
+```
+
+---
+
+# 14. 找到下一個 Header
+
+Header 裡：
+
+```c
+header->c_filesize
+```
+
+可以取得 file data 的長度：
+
+```c
+unsigned int filesize =
+    hex_to_uint(header->c_filesize, 8);
+```
+
+因此下一個 Header：
+
+```c
+header = (struct cpio_newc_header *)align4(
+    (unsigned long)fileDataPtr + filesize
+);
+```
+
+完整公式：
+
+```text
+filename
+= header + sizeof(header)
+
+file data
+= align4(
+    header + sizeof(header) + namesize
+)
+
+next header
+= align4(
+    file data + filesize
+)
+```
+
+這三個公式就是目前 CPIO parser 的核心。
+
+---
+
+# 15. TRAILER!!!
+
+怎麼知道整個 CPIO archive 已經結束？
+
+最後會有一個特殊 entry：
+
+```text
+TRAILER!!!
+```
+
+所以 parser：
+
+```c
+if (str_equal(filename, "TRAILER!!!")) {
+    break;
+}
+```
+
+因此：
+
+```text
+單一檔案的結尾
+→ c_filesize
+
+整個 Archive 的結尾
+→ TRAILER!!!
+```
+
+---
+
+# 16. cpio_list()
+
+`cpio_list()` 負責從第一個 Header 開始，一路走訪整個 CPIO archive。
+
+核心流程：
+
+```text
+Header
+↓
+取得 filename
+↓
+取得 namesize
+↓
+判斷 TRAILER!!!
+↓
+取得 filesize
+↓
+算 File Data
+↓
+算 Next Header
+↓
+繼續
+```
+
+實作概念：
+
+```c
+void cpio_list(void)
+{
+    struct cpio_newc_header *header =
+        (struct cpio_newc_header *)CPIO_ADD;
+
+    while (1) {
+        char *filename =
+            (char *)header
+            + sizeof(struct cpio_newc_header);
+
+        unsigned int namesize =
+            hex_to_uint(header->c_namesize, 8);
+
+        if (str_equal(filename, "TRAILER!!!")) {
+            break;
+        }
+
+        uart_puts(filename);
+        uart_puts("\r\n");
+
+        unsigned int filesize =
+            hex_to_uint(header->c_filesize, 8);
+
+        char *fileDataPtr = (char *)align4(
+            (unsigned long)header
+            + sizeof(struct cpio_newc_header)
+            + namesize
+        );
+
+        header =
+            (struct cpio_newc_header *)align4(
+                (unsigned long)fileDataPtr
+                + filesize
+            );
+    }
+}
+```
+
+測試結果：
+
+```text
+CPIO list file
+.
+hello.txt
+test.txt
+TRAILER!!! STOP!!!
+```
+
+---
+
+# 17. 不要用 uart_puts() 直接印 File Data
+
+`uart_puts()` 需要：
+
+```text
+'\0'
+```
+
+作為結尾。
+
+但是 CPIO 的 file data 是：
+
+```text
+filesize bytes
+```
+
+不保證最後有：
+
+```text
+'\0'
+```
+
+因此不要：
+
+```c
+uart_puts(fileDataPtr);
+```
+
+應該：
+
+```c
+for (unsigned int i = 0; i < filesize; i++) {
+    uart_send(fileDataPtr[i]);
+}
+```
+
+這樣只會讀指定的：
+
+```text
+filesize bytes
+```
+
+---
+
+# 18. cpio_find_file()
+
+單純 `cpio_list()` 只能證明：
+
+```text
+可以走訪 archive
+```
+
+真正的 Initial Ramdisk 功能還應該能做到：
+
+```text
+給 pathname
+↓
+找到對應檔案
+↓
+取得 data
+↓
+取得 size
+```
+
+介面：
+
+```c
+int cpio_find_file(
+    const char *target,
+    char **data,
+    unsigned int *size
+);
+```
+
+三個參數：
+
+```text
+target
+→ Input
+→ 我要找哪個檔案
+
+data
+→ Output
+→ 找到後 File Data 在哪個 address
+
+size
+→ Output
+→ 找到後 File Data 有多大
+```
+
+例如：
+
+```c
+char *data;
+unsigned int size;
+
+if (cpio_find_file("hello.txt", &data, &size)) {
+    ...
+}
+```
+
+---
+
+# 19. 為什麼 data 是 char **？
+
+caller：
+
+```c
+char *data;
+```
+
+如果 function 要修改 caller 的：
+
+```text
+data pointer
+```
+
+就需要傳：
+
+```c
+&data
+```
+
+型別就是：
+
+```c
+char **
+```
+
+因此 callee：
+
+```c
+*data = fileDataPtr;
+```
+
+就能讓 caller 最後：
+
+```text
+data
+ ↓
+hello.txt 的內容
+```
+
+---
+
+# 20. 為什麼 size 是 unsigned int *？
+
+C function argument 本質上都是 pass by value。
+
+如果：
+
+```c
+void test(unsigned int size)
+{
+    size = 20;
+}
+```
+
+caller：
+
+```c
+unsigned int size = 0;
+test(size);
+```
+
+執行後：
+
+```text
+size 還是 0
+```
+
+因為修改的是 copy。
+
+所以：
+
+```c
+void test(unsigned int *size)
+{
+    *size = 20;
+}
+```
+
+caller：
+
+```c
+test(&size);
+```
+
+才可以修改 caller 的變數。
+
+因此：
+
+```c
+unsigned int *size
+```
+
+是 output parameter。
+
+---
+
+# 21. cpio_find_file() 實作
+
+核心流程：
+
+```text
+從第一個 Header 開始
+↓
+取得 filename
+↓
+如果 TRAILER!!! → 找不到
+↓
+算 filesize
+↓
+算 fileDataPtr
+↓
+filename == target ?
+    ↓ Yes
+回傳：
+data
+size
+↓
+No
+↓
+Next Header
+```
+
+實作：
+
+```c
+int cpio_find_file(
+    const char *target,
+    char **data,
+    unsigned int *size
+)
+{
+    struct cpio_newc_header *header =
+        (struct cpio_newc_header *)CPIO_ADD;
+
+    while (1) {
+        char *filename =
+            (char *)header
+            + sizeof(struct cpio_newc_header);
+
+        unsigned int namesize =
+            hex_to_uint(header->c_namesize, 8);
+
+        if (str_equal(filename, "TRAILER!!!")) {
+            break;
+        }
+
+        unsigned int filesize =
+            hex_to_uint(header->c_filesize, 8);
+
+        char *fileDataPtr = (char *)align4(
+            (unsigned long)header
+            + sizeof(struct cpio_newc_header)
+            + namesize
+        );
+
+        if (str_equal(filename, target)) {
+            *size = filesize;
+            *data = fileDataPtr;
+
+            return 1;
+        }
+
+        header =
+            (struct cpio_newc_header *)align4(
+                (unsigned long)fileDataPtr
+                + filesize
+            );
+    }
+
+    return 0;
+}
+```
+
+目前定義：
+
+```text
+return 1
+→ 找到
+
+return 0
+→ 找不到
+```
+
+---
+
+# 22. Magic Sanity Check
+
+為了避免 address 計算錯誤後，繼續把垃圾 memory 當作 CPIO Header，可以每次進 loop 先檢查：
+
+```text
+070701
+```
+
+例如：
+
+```c
+static int cpio_valid_magic(
+    struct cpio_newc_header *header
+)
+{
+    const char magic[6] =
+        {'0', '7', '0', '7', '0', '1'};
+
+    for (int i = 0; i < 6; i++) {
+        if (header->c_magic[i] != magic[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+```
+
+使用：
+
+```c
+if (!cpio_valid_magic(header)) {
+    uart_puts("Invalid CPIO magic\r\n");
+    return 0;
+}
+```
+
+這是很好用的 debug invariant：
+
+> 每一個合法的 newc entry 開頭都應該是 `070701`。
+
+如果突然不是：
+
+```text
+070701
+```
+
+通常代表：
+
+```text
+Next Header Address 算錯
+```
+
+---
+
+# 23. CPIO Debug 方法
+
+如果 parser 出現亂碼，不要第一時間懷疑 encoding。
+
+通常優先懷疑：
+
+```text
+Pointer / Address Calculation
+```
+
+建議逐步印：
+
+```text
+Header Address
+Magic
+namesize
+filesize
+Filename Address
+File Data Address
+Next Header Address
+```
+
+最重要的 invariant：
+
+```text
+每次進入新的 Header
+↓
+c_magic 都應該是 070701
+```
+
+如果：
+
+```text
+Entry 1 magic = 070701
+Entry 2 magic = 070701
+Entry 3 magic = hello.
+```
+
+代表：
+
+```text
+Entry 2
+↓
+Entry 3
+```
+
+的 address calculation 出錯。
+
+---
+
+# 24. UART 的 \r 與 \n
+
+曾經出現：
+
+```text
+070701
+      Board revision...
+```
+
+原因是：
+
+```c
+uart_send('\n');
+```
+
+只有 Line Feed：
+
+```text
+往下一行
+```
+
+但是沒有：
+
+```text
+Carriage Return
+```
+
+所以游標沒有回到最左邊。
+
+正確：
+
+```c
+uart_puts("\r\n");
+```
+
+其中：
+
+```text
+\r
+→ 回到行首
+
+\n
+→ 下一行
+```
+
+---
+
+# 25. Reboot / Reload Kernel
+
+由於目前使用 QEMU，Lab 提供的 Raspberry Pi watchdog reboot 不適用。
+
+目前 memory：
+
+```text
+0x60000
+UART Bootloader
+
+0x80000
+Kernel
+```
+
+因此可以在 Kernel 做：
+
+```c
+void reboot(void)
+{
+    void (*bootloader)(void) =
+        (void (*)(void))0x60000;
+
+    bootloader();
+
+    while (1) {
+    }
+}
+```
+
+這不是完整硬體 reset，而是：
+
+```text
+Kernel
+↓
+jump 0x60000
+↓
+重新進入 UART Bootloader
+↓
+重新接收 kernel8.img
+```
+
+這樣測試時不需要每次關閉 QEMU。
+
+---
+
+# 26. 最終測試
+
+離開 Basic Exercise 3 前，至少確認：
+
+## Test 1：List Files
+
+```text
+.
+hello.txt
+test.txt
+```
+
+## Test 2：Find Existing File
+
+```c
+cpio_find_file("hello.txt", ...)
+```
+
+結果：
+
+```text
+return 1
+```
+
+並且：
+
+```text
+data → Hello from initramfs!
+size → 正確 filesize
+```
+
+## Test 3：Find Missing File
+
+```c
+cpio_find_file("not_exist.txt", ...)
+```
+
+結果：
+
+```text
+return 0
+```
+
+而且：
+
+```text
+不 crash
+不繼續亂讀 memory
+```
+
+---
+
+# 27. 本 Exercise 最後理解
+
+Initial Ramdisk 的核心不是：
+
+```text
+做一個真正的 filesystem
+```
+
+也不是：
+
+```text
+實作 SD card driver
+```
+
+而是：
+
+```text
+Boot Firmware / QEMU
+↓
+先把一包檔案放進 RAM
+↓
+Kernel
+↓
+解析 CPIO
+↓
+取得 early boot 所需要的檔案
+```
+
+目前完成的是：
+
+```text
+✅ 建立 initramfs.cpio
+✅ QEMU 載入 CPIO 到 RAM
+✅ 驗證 newc magic
+✅ ASCII Hex 解析
+✅ 4-byte alignment
+✅ 走訪 CPIO Entry
+✅ cpio_list()
+✅ cpio_find_file()
+✅ TRAILER!!! 判斷
+✅ CPIO Header sanity check
+```
+
+因此：
+
+```text
+Basic Exercise 3 - Initial Ramdisk
+→ Completed
+```
+
+下一個 Exercise：
+
+```text
+Basic Exercise 4 - Simple Allocator
+```
+
+---
+
+# 核心公式整理
+
+最後只要記住這三條：
+
+```c
+filename =
+    (char *)header
+    + sizeof(struct cpio_newc_header);
+```
+
+```c
+fileDataPtr =
+    (char *)align4(
+        (unsigned long)header
+        + sizeof(struct cpio_newc_header)
+        + namesize
+    );
+```
+
+```c
+nextHeader =
+    (struct cpio_newc_header *)align4(
+        (unsigned long)fileDataPtr
+        + filesize
+    );
+```
+
+整個 parser 本質就是：
+
+```text
+Header
+  ↓
+Filename
+  ↓
+align4
+  ↓
+File Data
+  ↓
+align4
+  ↓
+Next Header
+  ↓
+重複
+  ↓
+TRAILER!!!
+  ↓
+STOP
+```

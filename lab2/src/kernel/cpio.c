@@ -87,3 +87,36 @@ void cpio_list(void) {
     }
     uart_puts("==================================\r\n");
 }
+
+// cpio_file := ALGN(4) + cpio_newc_header + filename + "\0" + ALGN(4) + data
+int cpio_find_file(
+    const char *target,
+    char **data,
+    unsigned int *size
+){
+    struct cpio_newc_header* header = (struct cpio_newc_header *) CPIO_ADD;
+
+    while(1){
+        char *filename = (char *)header + sizeof(struct cpio_newc_header);
+        unsigned int namesize = hex_to_uint(header->c_namesize, 8);
+        if(str_equal(filename, "TRAILER!!!")) {
+           break;
+        }
+
+        unsigned int filesize = hex_to_uint(header->c_filesize, 8);
+        char *fileDataPtr = (char *)align4((unsigned long)header + sizeof(struct cpio_newc_header) + namesize);
+        if(str_equal(filename, target)) {
+            // get file size
+            *size = filesize;
+
+            // get file inforamtion 
+            *data = fileDataPtr;
+
+            return 1;
+        }
+        header = (struct cpio_newc_header*) align4((unsigned long)fileDataPtr + filesize);
+    }
+    return 0;
+}
+
+

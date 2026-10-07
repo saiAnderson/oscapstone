@@ -5,7 +5,11 @@ void cpio_test(void);
 unsigned int hex_to_uint(const char *s, int len);
 unsigned long align4(unsigned long addr);
 void cpio_list(void);
-
+int cpio_find_file(
+    const char *target,
+    char **data,
+    unsigned int *size
+);
 
 struct cpio_newc_header {
     char c_magic[6];

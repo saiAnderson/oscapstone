@@ -8,7 +8,25 @@ void kernel_main(void)
 {
     uart_init();
     uart_puts("Welcome to my shell!\n");
-    cpio_list();
+    
+    // ================================================
+    // cpio test 
+    // cpio_list();
+    uart_puts("TEST CPIO FIND\r\n");
+    char *data;
+    unsigned int size;
+
+    if (cpio_find_file("helo.txt", &data, &size)) {
+        for (unsigned int i = 0; i < size; i++) {
+            uart_send(data[i]);
+        }
+    }
+    else {
+        uart_puts("file didn't exit\r\n");
+    }
+    uart_puts("\r\n");
+    // ================================================
+
     HardwareInfo info;
     uart_puts("mailbox TEST\r\n");
     uart_puts("==================================\r\n");
