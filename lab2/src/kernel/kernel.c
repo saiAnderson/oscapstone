@@ -4,19 +4,33 @@
 #include "cpio.h"
 #include <stddef.h>
 
-void kernel_main(void)
+void kernel_main(void *dtb)
 {
+
+    //===================
     uart_init();
     uart_puts("Welcome to my shell!\n");
+
+    // ==================
+    // dtb
+    const uint8_t *dtb_base = (const uint8_t *) dtb;
+    uart_puts("DTB magic: ");
+    uart_hex(dtb_read_be32(dtb_base));
+    uart_puts("\r\n");
+
+    uart_puts("DTB total size: ");
+    uart_hex(dtb_read_be32(dtb_base + 4));
+    uart_puts("\r\n");
     
     // ================================================
     // cpio test 
     // cpio_list();
+    uart_puts("==================================\r\n");
     uart_puts("TEST CPIO FIND\r\n");
     char *data;
     unsigned int size;
 
-    if (cpio_find_file("helo.txt", &data, &size)) {
+    if (cpio_find_file("hello.txt", &data, &size)) {
         for (unsigned int i = 0; i < size; i++) {
             uart_send(data[i]);
         }

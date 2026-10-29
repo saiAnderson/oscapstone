@@ -11,13 +11,13 @@
 
 // 將 KERNEL_ADDRESS 視為 kernel 的 function entry。
 // 呼叫 function pointer 後，CPU 會跳到該位址開始執行 kernel。
-static void jump_to_kernel(void){
-    void (*kernel_entry) (void) = (void(*)(void))KERNEL_ADDRESS;
-    kernel_entry();
+static void jump_to_kernel(void* dtb_addr){
+    void (*kernel_entry) (void*) = (void(*)(void*))KERNEL_ADDRESS;
+    kernel_entry(dtb_addr);
 }
 
 
-void bootloader_main(void){ 
+void bootloader_main(void* dtb_addr){ 
     uart_init();
 
     uart_puts("Waiting for kernel8.img......\n");
@@ -43,5 +43,5 @@ void bootloader_main(void){
     uart_puts("Success load kernel8.img into memory\n\n");
 
     // change PC 
-    jump_to_kernel();
+    jump_to_kernel(dtb_addr);
 }

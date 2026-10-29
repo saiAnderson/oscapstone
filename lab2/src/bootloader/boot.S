@@ -7,6 +7,8 @@
 .extern bootloader_main
 
 _start:
+  /*x0 is the address DTB*/
+  mov x20, x0
   /*
    * 讀取目前 CPU core 的 MPIDR_EL1，
    * 將結果放入一個通用暫存器。
@@ -55,6 +57,8 @@ clear_bss:
   b clear_bss
 
 clear_bss_done:
+  // move DTB address to x0
+  mov x0, x20 
   /* 步驟 6：呼叫 bootloader_main */
   bl bootloader_main
 

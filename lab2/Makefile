@@ -90,7 +90,8 @@ KERNEL_OBJS := $(KERNEL_BUILD_DIR)/boot.o \
                $(KERNEL_BUILD_DIR)/uart.o \
                $(KERNEL_BUILD_DIR)/shell.o \
                $(KERNEL_BUILD_DIR)/mailbox.o \
-			   $(KERNEL_BUILD_DIR)/cpio.o
+			   $(KERNEL_BUILD_DIR)/cpio.o \
+			   $(KERNEL_BUILD_DIR)/dtb.o
 
 KERNEL_ELF := $(KERNEL_BUILD_DIR)/kernel8.elf
 KERNEL_IMG := $(KERNEL_BUILD_DIR)/kernel8.img
@@ -157,7 +158,6 @@ $(BOOT_IMG): $(BOOT_ELF)
 	$(OBJCOPY) -O binary $< $@
 
 
-
 # ============================================================
 # Kernel compilation
 # ============================================================
@@ -173,6 +173,7 @@ $(KERNEL_BUILD_DIR)/kernel.o: \
 	$(INCLUDE_DIR)/shell.h \
 	$(INCLUDE_DIR)/mailbox.h \
 	$(INCLUDE_DIR)/cpio.h \
+	$(INCLUDE_DIR)/dtb.h \
 	| $(KERNEL_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -205,6 +206,13 @@ $(KERNEL_BUILD_DIR)/cpio.o: \
 	| $(KERNEL_BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# src/kernel/dtb.c -> build/kernel/dtb.o
+$(KERNEL_BUILD_DIR)/dtb.o: \
+	$(KERNEL_SRC_DIR)/dtb.c \
+	$(INCLUDE_DIR)/dtb.h \
+	| $(KERNEL_BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # ============================================================
 # Kernel linking
 # ============================================================
@@ -231,6 +239,7 @@ run: $(BOOT_IMG)
 		-M raspi3b \
 		-device loader,file=initramfs.cpio,addr=0x08000000,force-raw=on \
 		-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
+		-dtb bcm2710-rpi-3-b-plus.dtb \
 		-display none \
 		-serial null \
 		-serial pty \

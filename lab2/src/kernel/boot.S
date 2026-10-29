@@ -7,6 +7,8 @@
 .extern kernel_main
 
 _start:
+  /*x0 is the address DTB*/
+  mov x20, x0
   /*
    * TODO 1：
    * 讀取目前 CPU core 的 MPIDR_EL1，
@@ -59,6 +61,8 @@ clear_bss:
   b clear_bss
 
 clear_bss_done:
+  // move DTB address to x0
+  mov x0, x20 
   /* 步驟 6：呼叫 kernel_main */
   bl kernel_main
 
