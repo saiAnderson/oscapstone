@@ -17,16 +17,16 @@ static int str_equal(char *s1, char *s2){
     return (*s1=='\0'&&*s2=='\0');
 }
 
-static void reboot(void){
-    void (*bootloader) (void) = (void (*)(void)) BOOTLOADER_ADD;
-    bootloader();
+static void reboot(void* dtb){
+    void (*bootloader) (void *) = (void (*)(void *)) BOOTLOADER_ADD;
+    bootloader(dtb);
 
     // for 保險不小心回來後繼續跑舊的 kernel
     while(1){
     }
 }
 
-void shell_run(void){
+void shell_run(void *dtb){
     uart_puts("# ");
     index = 0;
     int is_prev_r = 0;
@@ -54,7 +54,7 @@ void shell_run(void){
                 }
                 else if(str_equal("reboot" ,buffer)){
                     uart_puts("Rebooting to bootloader...");
-                    reboot();
+                    reboot(dtb);
                 }
                 // not exit command
                 else {
