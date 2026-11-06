@@ -8,6 +8,7 @@ NM      := $(CROSS_COMPILE)nm
 OBJDUMP := $(CROSS_COMPILE)objdump
 
 QEMU := qemu-system-aarch64
+GDB_ADDR := 127.0.0.1:1234
 
 # ============================================================
 # Directory layout
@@ -101,7 +102,7 @@ KERNEL_MAP := $(KERNEL_BUILD_DIR)/kernel.map
 # Main targets
 # ============================================================
 
-.PHONY: all bootloader kernel run \
+.PHONY: all bootloader kernel run run-debug gdb-kernel \
         inspect inspect-bootloader inspect-kernel clean
 
 all: bootloader kernel
@@ -244,6 +245,12 @@ run: $(BOOT_IMG)
 		-serial null \
 		-serial pty \
 		2>&1 | $(PTY_CAPTURE) $(UART_PTY_FILE)
+
+run-debug: override QEMU += -S -gdb tcp:$(GDB_ADDR)
+run-debug: run
+
+gdb-kernel: $(KERNEL_IMG)
+	gdb-multiarch $(KERNEL_ELF) -ex "target remote $(GDB_ADDR)"
 
 # 將目前 terminal 與 QEMU 的 UART PTY 做雙向連接，
 # rawer 關閉 terminal 的字元處理與 echo，Ctrl+O (0x0f) 用來離開 socat。

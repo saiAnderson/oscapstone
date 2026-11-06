@@ -18,7 +18,7 @@ void kernel_main(void *dtb)
 
     // ==================
     // dtb
-    dtb_parse(dtb);
+    dtb_traverse(dtb);
 
     // ================================================
     // cpio test 
