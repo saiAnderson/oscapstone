@@ -4,8 +4,9 @@
 void cpio_test(void);
 unsigned int hex_to_uint(const char *s, int len);
 unsigned long align4(unsigned long addr);
-void cpio_list(void);
+void cpio_list(void *archive_start);
 int cpio_find_file(
+    void *archive_start,
     const char *target,
     char **data,
     unsigned int *size

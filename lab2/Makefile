@@ -99,6 +99,15 @@ KERNEL_IMG := $(KERNEL_BUILD_DIR)/kernel8.img
 KERNEL_MAP := $(KERNEL_BUILD_DIR)/kernel.map
 
 # ============================================================
+# INITRAMFS and dtb 
+# ============================================================
+INITRAMFS      := initramfs.cpio
+INITRAMFS_ADDR := 0x08000000
+
+DTB_ORIG       := bcm2710-rpi-3-b-plus.dtb
+DTB_INITRD     := build/initramfs.dtb
+
+# ============================================================
 # Main targets
 # ============================================================
 
@@ -228,19 +237,30 @@ $(KERNEL_ELF): $(KERNEL_OBJS) $(KERNEL_LINKER_SCRIPT)
 $(KERNEL_IMG): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
 
+# ============================================================
+# dtb setting
+# ============================================================
+$(DTB_INITRD): $(DTB_ORIG) $(INITRAMFS)
+	@mkdir -p $(dir $@)
+	cp $< $@
+	@set -e; \
+	size=$$(stat -c%s "$(INITRAMFS)"); \
+	end=$$(( $(INITRAMFS_ADDR) + size )); \
+	fdtput -t x "$@" /chosen linux,initrd-start "$(INITRAMFS_ADDR)"; \
+	fdtput -t x "$@" /chosen linux,initrd-end "$$(printf '%x' "$$end")"
 
 # ============================================================
 # QEMU
 # ============================================================
 
 # 使用 uart bootloader load kernel8.img 
-run: $(BOOT_IMG)
+run: $(BOOT_IMG) $(DTB_INITRD)
 	rm -f $(UART_PTY_FILE)
 	$(QEMU) \
 		-M raspi3b \
-		-device loader,file=initramfs.cpio,addr=0x08000000,force-raw=on \
+		-device loader,file=$(INITRAMFS),addr=$(INITRAMFS_ADDR),force-raw=on \
+		-dtb $(DTB_INITRD) \
 		-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
-		-dtb bcm2710-rpi-3-b-plus.dtb \
 		-display none \
 		-serial null \
 		-serial pty \

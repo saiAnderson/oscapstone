@@ -5,6 +5,13 @@
 #include "dtb.h"
 #include <stddef.h>
 
+struct initramfs_info {
+    const void *dtb;
+    uint64_t start;
+    uint64_t end;
+    int found;
+};
+
 static int str_equal(char *s1, char *s2){
     while( *s1!='\0' && *s2!='\0'){
         if(*s1 != *s2){
@@ -16,31 +23,76 @@ static int str_equal(char *s1, char *s2){
     return (*s1=='\0'&&*s2=='\0');
 }
 
-static int print_node(
+static int find_initramfs(
     uint32_t node_offset,
     const char *node_name,
     int depth,
     void *context
 ){
-    if(depth == 1 && str_equal(node_name, "chosen")){
-        uint32_t len = 0;
+    struct initramfs_info *info = (struct initramfs_info *)context;
 
-        const uint8_t *value = dtb_getprop(
-            context,
+    if(depth == 1 && str_equal(node_name, "chosen")){
+        uint32_t start_len = 0, end_len;
+
+        const uint8_t *start_value = dtb_getprop(
+            info->dtb,
             node_offset,
-            "stdout-path",
-            &len 
+            "linux,initrd-start",
+            &start_len 
         );
 
-        if (value != NULL) {
-            uart_puts("Found stdout-path!\r\n");
+        const uint8_t *end_value = dtb_getprop(
+            info->dtb,
+            node_offset,
+            "linux,initrd-end",
+            &end_len
+        );
 
-            uart_puts("Property Length: ");
-            uart_hex(len);
-            uart_puts("\r\n");
+        if (start_value != NULL && end_value != NULL) {
+            // get initrd_start address from former 32 bits and end 32 bits
+            uint64_t initrd_start_addr_front32 = 0;
+            uint64_t initrd_start_addr_end32 = 0;
+            uint64_t initrd_start_addr = 0;
+            if(start_len == 4){
+                initrd_start_addr = dtb_read_be32(start_value);
+                uart_hex(initrd_start_addr);
+                uart_puts("\r\n");
+            }
+            else if(start_len == 8){
+                initrd_start_addr_front32 = (uint64_t)dtb_read_be32(start_value);
+                initrd_start_addr_end32 = (uint64_t)dtb_read_be32(start_value + 4);
+                initrd_start_addr = (initrd_start_addr_front32<<32) | initrd_start_addr_end32;
+            }
+            else {
+                uart_puts("Unsupported initrd address length\r\n");
+                return 0;
+            }
+            
+            // get initrd_end address from former 32 bits and end 32 bits
+            uint64_t initrd_end_addr_front32 = 0;
+            uint64_t initrd_end_addr_end32 = 0;
+            uint64_t initrd_end_addr = 0;
+            if(end_len == 4){
+                initrd_end_addr = dtb_read_be32(end_value);
+                uart_hex(initrd_end_addr);
+                uart_puts("\r\n");
+            }
+            else if(end_len == 8){
+                initrd_end_addr_front32 = (uint64_t)dtb_read_be32(end_value);
+                initrd_end_addr_end32 = (uint64_t)dtb_read_be32(end_value + 4);
+                initrd_end_addr = (initrd_end_addr_front32<<32) | initrd_end_addr_end32;
+            }
+            else {
+                uart_puts("Unsupported initrd address length\r\n");
+                return 0;
+            }
+
+            info->start = initrd_start_addr;
+            info->end = initrd_end_addr;
+            info->found = 1;
         }
         else {
-            uart_puts("stdout-path not found\r\n");
+            uart_puts("linux,initrd-start not found\r\n");
         }
     }
     return 0;
@@ -53,29 +105,28 @@ void kernel_main(void *dtb)
     uart_init();
     uart_puts("Welcome to my shell!\n");
 
-    // TEST
-    uint32_t len = 0;
-
-const uint8_t *value = dtb_getprop(
-    dtb,
-    0,              // Root Node Offset
-    "compatible",
-    &len
-);
-
-if (value != NULL) {
-    uart_puts("Root compatible found! Length: ");
-    uart_hex(len);
-    uart_puts("\r\n");
-}
-else {
-    uart_puts("Root compatible not found!\r\n");
-}
-    //=======
-
     // ==================
     // dtb
-    dtb_traverse(dtb, print_node, dtb);
+    struct initramfs_info ramdisk_info = {
+        .dtb = dtb,
+        .start = 0,
+        .end = 0,
+        .found = 0,
+    };
+    dtb_traverse(dtb, find_initramfs, &ramdisk_info);
+
+    if (ramdisk_info.found) {
+        uart_puts("Initramfs Start: ");
+        uart_hex((uint32_t)ramdisk_info.start);
+        uart_puts("\r\n");
+        
+        uart_puts("Initramfs End: ");
+        uart_hex((uint32_t)ramdisk_info.end);
+        uart_puts("\r\n");
+    }
+    else {
+        uart_puts("Failed to find Initramfs Address\r\n");
+    }
 
     // ================================================
     // cpio test 
@@ -85,7 +136,15 @@ else {
     char *data;
     unsigned int size;
 
-    if (cpio_find_file("hello.txt", &data, &size)) {
+    if(!ramdisk_info.found || ramdisk_info.end <= ramdisk_info.start) {
+        uart_puts("Initramfs unavailable\r\n");
+    }
+    else if(cpio_find_file(
+        (void *)(uintptr_t)ramdisk_info.start,
+        "hello.txt",
+        &data,
+        &size
+    )){
         for (unsigned int i = 0; i < size; i++) {
             uart_send(data[i]);
         }

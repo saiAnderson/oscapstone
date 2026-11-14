@@ -3,14 +3,6 @@
 #include <stddef.h>
 #define CPIO_ADD 0x08000000
 
-// void cpio_test(void) {
-//     struct cpio_newc_header *header = (struct cpio_newc_header *) 0x08000000;
-//     for(int i=0;i<6;i++){
-//         uart_send(header->c_magic[i]);
-//     }
-//     uart_puts("\r\n");
-// }
-
 static int str_equal(char *s1, char *s2){
     while( *s1!='\0' && *s2!='\0'){
         if(*s1 != *s2){
@@ -46,11 +38,11 @@ unsigned long align4(unsigned long n) {
 
 
 // cpio_file := ALGN(4) + cpio_newc_header + filename + "\0" + ALGN(4) + data
-void cpio_list(void) {
+void cpio_list(void *archive_start) {
     // cpio message
     uart_puts("CPIO TEST\r\nCPIO list file\r\n");
     uart_puts("==================================\r\n");
-    struct cpio_newc_header *header = (struct cpio_newc_header *) CPIO_ADD;
+    struct cpio_newc_header *header = (struct cpio_newc_header *) archive_start;
 
     while(1) {
         // get filename info (filename, filename size)
@@ -90,11 +82,12 @@ void cpio_list(void) {
 
 // cpio_file := ALGN(4) + cpio_newc_header + filename + "\0" + ALGN(4) + data
 int cpio_find_file(
+    void *archive_start,
     const char *target,
     char **data,
     unsigned int *size
 ){
-    struct cpio_newc_header* header = (struct cpio_newc_header *) CPIO_ADD;
+    struct cpio_newc_header* header = (struct cpio_newc_header *) archive_start;
 
     while(1){
         char *filename = (char *)header + sizeof(struct cpio_newc_header);
