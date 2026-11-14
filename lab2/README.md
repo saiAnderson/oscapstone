@@ -3198,3 +3198,786 @@ TRAILER!!!
   ↓
 STOP
 ```
+
+# Advanced Exercise 2 - Device Tree (DTB)
+
+> **Project:** [Raspberry Pi 3 Bare-Metal OS — Lab 2](https://github.com/saiAnderson/oscapstone/tree/main/lab2)  
+> **Environment:** QEMU `raspi3b` / AArch64 / UART Bootloader  
+> **實作範圍：** FDT Traversal、Node Callback、Property Lookup、從 `/chosen` 取得 Initramfs Address、移除 CPIO Parser 對固定載入地址的依賴。
+
+## 目標
+
+在先前的 Initial Ramdisk Practice 中，QEMU 已經能將 `initramfs.cpio` 放到 RAM，Kernel 也可以解析 CPIO。但 CPIO Parser 一開始使用固定地址：
+
+```c
+#define CPIO_ADD 0x08000000
+```
+
+這表示只要載入位置改變，就必須改程式碼、重新編譯 Kernel。這次練習的目標是改成由**開機資訊提供地址，Kernel 負責讀取，CPIO Parser 負責解析**：
+
+```text
+QEMU / Makefile
+    ├── initramfs.cpio → RAM 0x08000000
+    └── 包含 Initramfs 地址資訊的 DTB
+                │
+                ▼
+        UART Bootloader
+        保留並傳遞 DTB Pointer
+                │
+                ▼
+            Kernel
+                │
+                ├── dtb_traverse()：尋找 /chosen
+                ├── dtb_getprop()：讀取 start / end
+                └── find_initramfs()：解碼、存入 context
+                │
+                ▼
+       cpio_find_file(archive_start, ...)
+                │
+                ▼
+        Hello from initramfs!
+```
+
+最重要的設計原則：**DTB 不存放 CPIO 檔案本身，而是傳遞 Initramfs 在 RAM 中的位置資訊。**
+
+---
+
+## 1. Device Tree 是什麼？
+
+Device Tree 用來描述硬體配置以及開機時要傳給 Kernel 的部分資訊。DTS 是可閱讀的文字格式；DTB（Device Tree Blob）是編譯後的二進位格式。
+
+例如 DTS 中的：
+
+```dts
+/ {
+    chosen {
+        stdout-path = "serial0:115200n8";
+        linux,initrd-start = <0x08000000>;
+        linux,initrd-end = <0x08000400>;
+    };
+};
+```
+
+- `/`：Root Node。
+- `/chosen`：放置部分開機參數的節點，不是硬體裝置。
+- `stdout-path`：預期使用的輸出裝置路徑。
+- `linux,initrd-start`：Initramfs 在 RAM 中的起始地址。
+- `linux,initrd-end`：Initramfs 結束地址，採用 **end-exclusive**，即範圍 `[start, end)`。
+
+這裡的 `0x08000400` 以 1,024 bytes 的 CPIO 檔案為例：
+
+```text
+start = 0x08000000
+size  = 0x00000400 = 1024 bytes
+end   = 0x08000400
+```
+
+**Node 與 Property 的差別**：Node 是階層中的節點，Property 是該節點下的「名稱與資料」。找到 `/chosen` 不代表已經讀到 `linux,initrd-start`，需要再查詢 Property。
+
+---
+
+## 2. Flattened Device Tree（FDT）的二進位結構
+
+DTB 不是純文字，它由 Header、Memory Reservation Block、Structure Block 與 Strings Block 組成；後面兩個 Block 是這次 Parser 的核心。
+
+```text
+DTB Base
+  │
+  ├── FDT Header
+  │     magic / totalsize / off_dt_struct / off_dt_strings / ...
+  ├── Memory Reservation Block
+  ├── Structure Block
+  │     FDT_BEGIN_NODE, FDT_PROP, FDT_END_NODE, ...
+  └── Strings Block
+        Property Name 字串
+```
+
+### 2.1 Header 讀取
+
+`dtb.c` 透過 Header 的固定 Offset 取得必要資訊：
+
+| Header Offset | 欄位 | 用途 |
+| --- | --- | --- |
+| `+0` | `magic` | 檢查 DTB Magic `0xD00DFEED` |
+| `+4` | `totalsize` | DTB 的總大小 |
+| `+8` | `off_dt_struct` | Structure Block 相對 DTB Base 的 Offset |
+| `+12` | `off_dt_strings` | Strings Block 相對 DTB Base 的 Offset |
+| `+36` | `size_dt_struct` | Structure Block 的大小 |
+
+DTB 的整數採用 **Big-Endian**，因此在 AArch64 的 C 程式中，不應直接把 Header 當作原生 `uint32_t` 來讀取。
+
+目前使用的 Helper：
+
+```c
+uint32_t dtb_read_be32(const uint8_t *ptr) {
+    uint32_t data = 0;
+    for (int i = 0; i < 4; i++) {
+        data <<= 8;
+        data |= ptr[i];
+    }
+    return data;
+}
+```
+
+例如 bytes `D0 0D FE ED` 會被解讀成 `0xD00DFEED`。
+
+### 2.2 Structure Block Token
+
+| Token | 值 | 作用 |
+| --- | --- | --- |
+| `FDT_BEGIN_NODE` | `0x1` | 開始一個 Node，後面接 Node Name 與 Padding |
+| `FDT_END_NODE` | `0x2` | 結束目前 Node |
+| `FDT_PROP` | `0x3` | Property，後面接 Length、Name Offset、Value |
+| `FDT_NOP` | `0x4` | 不需處理，略過 |
+| `FDT_END` | `0x9` | 整個 Structure Block 結束 |
+
+Node 的資料排列：
+
+```text
+[FDT_BEGIN_NODE: 4 bytes]
+[Node Name: NUL 結尾]
+[Padding: 補到 4-byte 對齊]
+[Properties ...]
+[Child Nodes ...]
+[FDT_END_NODE: 4 bytes]
+```
+
+Property 的資料排列：
+
+```text
+[FDT_PROP: 4 bytes]
+[len: 4 bytes]
+[nameoff: 4 bytes]
+[Property Value: len bytes]
+[Padding: 補到 4-byte 對齊]
+```
+
+**Node Name** 緊接 `FDT_BEGIN_NODE`；**Property Name** 則不在此處，而是由 `nameoff` 指向 Strings Block。
+
+### 2.3 4-byte Alignment
+
+Structure Block 的 Token 與 Payload 依規格對齊。以長度 `n` 為例：
+
+```c
+unsigned int align4(unsigned int n) {
+    return (n + 3U) & ~3U;
+}
+```
+
+| 原始長度 | 對齊後長度 |
+| --- | --- |
+| 4 | 4 |
+| 5 | 8 |
+| 7 | 8 |
+| 8 | 8 |
+
+對 Node Name 要跳過 `align4(strlen(name) + 1)`；`+1` 是結尾 `\0`。對 Property Value 則跳過 `align4(property_len)`。
+
+> 程式庫裡的 `dtb.c` 實際 Helper 名稱寫成 `algin4()`；此處使用 `align4()` 說明概念，避免混淆「4-byte 對齊」的用途。
+
+---
+
+## 3. `dtb_traverse()`：逐一走訪 Node
+
+來源：[src/kernel/dtb.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/dtb.c)、[include/dtb.h](https://github.com/saiAnderson/oscapstone/blob/main/lab2/include/dtb.h)
+
+```c
+void dtb_traverse(
+    const void *dtb,
+    dtb_node_callback_t callback,
+    void *context
+);
+```
+
+核心流程：
+
+1. 驗證 Header Magic，取得 Structure Block 的位置與大小。
+2. 從 Structure Block 開始逐一讀取 4-byte Token。
+3. 遇到 `FDT_BEGIN_NODE` 時取得 Node Name、計算 Node Offset，並呼叫 Callback。
+4. 遇到 `FDT_PROP` 時先讀取 Length，跳過 Property Payload 與 Padding。
+5. 遇到 `FDT_END_NODE` 時更新 Depth；遇到 `FDT_END` 時停止。
+
+目前程式中的 Node Offset 計算概念：
+
+```c
+const uint8_t *struct_start = base + off_dt_struct;
+uint32_t node_offset = (uint32_t)((cursor - 4) - struct_start);
+```
+
+這段是在讀完 `FDT_BEGIN_NODE` Token、`cursor` 已前進 4 bytes 後執行，因此 `cursor - 4` 指向該 Node Token 的位置。
+
+**注意：`node_offset` 是相對於 Structure Block 的 Offset，不是相對於整個 DTB 的 Offset，也不是 RAM 的絕對地址。**
+
+```text
+DTB Base
+    + off_dt_struct
+    + node_offset
+    = 該 Node 的 FDT_BEGIN_NODE 地址
+```
+
+### Depth 的用途
+
+程式以 `depth = -1` 開始，遇到 Root 的 `FDT_BEGIN_NODE` 後變成 0：
+
+```text
+/                    depth = 0
+├── chosen           depth = 1
+├── memory@0         depth = 1
+└── soc              depth = 1
+    └── serial@...   depth = 2
+```
+
+因此，判斷 `depth == 1 && node_name == "chosen"` 能定位 Root 底下的 `/chosen`，不會誤認更深層的同名節點。
+
+---
+
+## 4. Node Callback API：為什麼不把需求寫死在 Parser？
+
+在 `dtb.h` 定義：
+
+```c
+typedef int (*dtb_node_callback_t)(
+    uint32_t node_offset,
+    const char *node_name,
+    int depth,
+    void *context
+);
+```
+
+四個參數：
+
+| 參數 | 意義 |
+| --- | --- |
+| `node_offset` | 目前 Node 在 Structure Block 中的位置 |
+| `node_name` | 目前 Node 的名稱 |
+| `depth` | Node 所在的樹狀深度 |
+| `context` | 呼叫端提供的資料指標，供 Callback 讀寫結果 |
+
+`dtb_traverse()` 只負責「遍歷」；像 `find_initramfs()` 這種 Callback 才負責「找到哪個 Node、取得哪些資料」。
+
+```text
+kernel_main()
+    │
+    └── dtb_traverse(dtb, find_initramfs, &ramdisk_info)
+                │
+                ├── Root Node   → callback：不是 chosen
+                ├── memory@0    → callback：不是 chosen
+                └── chosen      → callback：符合，查詢 Property
+```
+
+這樣以後搜尋其他裝置時可以使用不同 Callback，而不必改動通用 Traversal。
+
+> 目前版本的 Callback 回傳型別是 `int`，但 `dtb_traverse()` 尚未利用回傳值實作「提前停止遍歷」。本次功能不依賴 Early Stop。
+
+---
+
+## 5. `dtb_getprop()`：在指定 Node 查詢 Property
+
+API：
+
+```c
+const uint8_t *dtb_getprop(
+    const void *dtb,
+    uint32_t node_offset,
+    const char *property_name,
+    uint32_t *len
+);
+```
+
+`dtb_getprop()` **每次只查詢一個 Property**。如果要取得 Start 和 End，就呼叫兩次。
+
+第一步是定位指定 Node：
+
+```c
+const uint8_t *node_ptr = base + off_dt_struct + node_offset;
+```
+
+此時 Pointer 指向 `FDT_BEGIN_NODE`，必須先跳過：
+
+```text
+[FDT_BEGIN_NODE][Node Name][Padding][FDT_PROP]...
+       ↑                                  ↑
+   起始位置                         搜尋起點
+```
+
+之後依序讀取 Property Token：
+
+- `FDT_PROP`：取得 `property_len` 和 `property_nameoff`，到 Strings Block 比對 Property Name；符合就回傳 Value Pointer，並透過 `*len` 回傳資料長度。
+- `FDT_NOP`：略過。
+- `FDT_BEGIN_NODE`：開始子節點，表示已離開目前 Node 自身的 Property 區域，停止搜尋。
+- `FDT_END_NODE`：目前 Node 結束，停止搜尋。
+- 找不到時：回傳 `NULL`。
+
+關鍵地址計算：
+
+```c
+const char *name =
+    (const char *)(base + off_dt_strings + property_nameoff);
+
+// 略過 FDT_PROP 後的 len 和 nameoff（共 8 bytes）
+node_ptr += 8;
+// 此時 node_ptr 指向 Property Value
+```
+
+### 為什麼回傳 Pointer 和 Length，而不是整數？
+
+DTB Property 不一定是整數，例如：
+
+```dts
+stdout-path = "serial0:115200n8";    // 字串
+linux,initrd-start = <0x08000000>;  // 地址
+```
+
+所以通用的 `dtb_getprop()` 只負責返回：
+
+```text
+value → 原始 Property Value 的記憶體位置
+len   → Value 佔用多少 bytes
+```
+
+如何解讀 Value，交給呼叫端決定。例如查詢 `stdout-path` 可以當作 NUL 結尾字串；`linux,initrd-start` 則必須依 Big-Endian 解碼，不能拿 `uart_puts()` 當字串印出。
+
+---
+
+## 6. 為什麼原始 DTB 找不到 `linux,initrd-start`？
+
+原始 `bcm2710-rpi-3-b-plus.dtb` 的 `/chosen` 在實驗中查到：
+
+```dts
+chosen {
+    stdout-path = "serial0:115200n8";
+    bootargs = "coherent_pool=1M ...";
+    phandle = <0x37>;
+};
+```
+
+也就是**沒有** `linux,initrd-start` 與 `linux,initrd-end`。
+
+這是因為原本 QEMU 使用：
+
+```makefile
+-device loader,file=initramfs.cpio,addr=0x08000000,force-raw=on
+```
+
+這個 Generic Loader 知道「把檔案 bytes 放到哪個 RAM Address」，卻沒有「這是 Initramfs，請自動更新 `/chosen`」的語意。
+
+**RAM 中存在 CPIO，與 DTB 有沒有記錄 CPIO 地址，是兩件不同的事情。**
+
+---
+
+## 7. Makefile：產生包含 Initramfs 資訊的 DTB
+
+來源：[Makefile](https://github.com/saiAnderson/oscapstone/blob/main/lab2/Makefile)
+
+```makefile
+INITRAMFS      := initramfs.cpio
+INITRAMFS_ADDR := 0x08000000
+
+DTB_ORIG       := bcm2710-rpi-3-b-plus.dtb
+DTB_INITRD     := build/initramfs.dtb
+```
+
+這裡 `INITRAMFS_ADDR` 是 QEMU 測試時載入 CPIO 的固定地址；重點是**地址配置由 Makefile 提供，而不是 CPIO Parser 自己寫死**。
+
+### 7.1 產生 DTB 的 Target
+
+以下是目前專案的實際 Rule：
+
+```makefile
+$(DTB_INITRD): $(DTB_ORIG) $(INITRAMFS)
+	@mkdir -p $(dir $@)
+	cp $< $@
+	@set -e; \
+	size=$$(stat -c%s "$(INITRAMFS)"); \
+	end=$$(( $(INITRAMFS_ADDR) + size )); \
+	fdtput -t x "$@" /chosen linux,initrd-start "$(INITRAMFS_ADDR)"; \
+	fdtput -t x "$@" /chosen linux,initrd-end "$$(printf '%x' "$$end")"
+```
+
+含義：
+
+1. `$(DTB_INITRD): $(DTB_ORIG) $(INITRAMFS)`：原始 DTB 或 CPIO 更新時，重新產生新 DTB。
+2. `cp $< $@`：複製原始 DTB（`$<`），輸出新 DTB（`$@`），避免覆蓋原檔。
+3. `stat -c%s`：取得 CPIO 真正的 Byte 數。
+4. `end = start + size`：算出 Initramfs 範圍的結束地址。
+5. `fdtput -t x`：將 32-bit 十六進位數值寫進新 DTB 的 `/chosen`。
+
+Makefile 中使用 `$$`，是為了讓 `$` 傳遞給 Shell，而不是先被 Make 展開。Recipe 的縮排必須是 **Tab**。
+
+### 7.2 `run` 的 Dependency
+
+```makefile
+run: $(BOOT_IMG) $(DTB_INITRD)
+```
+
+這表示啟動 QEMU 前，Make 必須先確認 Bootloader Image 和新的 DTB 已準備好。只在 Command 寫 `-dtb $(DTB_INITRD)`，**不會**自動建立該檔案，所以 Dependency 很重要。
+
+QEMU 會使用：
+
+```makefile
+-device loader,file=$(INITRAMFS),addr=$(INITRAMFS_ADDR),force-raw=on \
+-dtb $(DTB_INITRD) \
+-device loader,file=$(BOOT_IMG),addr=0x60000,cpu-num=0,force-raw=on \
+```
+
+注意只保留**一個** `-dtb`，避免同時指定原始與修改後的 DTB。
+
+---
+
+## 8. Bootloader 如何把 DTB Pointer 傳到 Kernel？
+
+來源：[Bootloader boot.S](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/bootloader/boot.S)、[Bootloader main.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/bootloader/main.c)、[Kernel boot.S](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/boot.S)
+
+在目前 QEMU 啟動路徑，DTB Pointer 透過 AArch64 的 `x0` 傳入 Bootloader：
+
+```asm
+mov x20, x0        // 暫存 DTB Pointer
+...
+mov x0, x20        // 呼叫 C function 前恢復到 x0
+bl bootloader_main
+```
+
+Bootloader 接收 Kernel 後，透過 Function Pointer 交接：
+
+```c
+static void jump_to_kernel(void *dtb_addr) {
+    void (*kernel_entry)(void *) = (void (*)(void *))KERNEL_ADDRESS;
+    kernel_entry(dtb_addr);
+}
+```
+
+Kernel 的 `boot.S` 也會保存、恢復 `x0`，最後呼叫：
+
+```c
+void kernel_main(void *dtb)
+```
+
+因此傳遞的是 **DTB 在 RAM 中的 Pointer**，並沒有在 Bootloader 裡複製整份 DTB。
+
+```text
+QEMU 建立 DTB
+      ↓ x0
+Bootloader _start
+      ↓
+bootloader_main(dtb_addr)
+      ↓
+jump_to_kernel(dtb_addr)
+      ↓ x0
+Kernel _start
+      ↓
+kernel_main(dtb)
+```
+
+---
+
+## 9. `find_initramfs()` 與 Callback Context
+
+來源：[src/kernel/kernel.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/kernel.c)
+
+在 `kernel.c` 定義：
+
+```c
+struct initramfs_info {
+    const void *dtb;
+    uint64_t start;
+    uint64_t end;
+    int found;
+};
+```
+
+`kernel_main()` 建立這份資料，傳入 `dtb_traverse()`：
+
+```c
+struct initramfs_info ramdisk_info = {
+    .dtb = dtb,
+    .start = 0,
+    .end = 0,
+    .found = 0,
+};
+
+dtb_traverse(dtb, find_initramfs, &ramdisk_info);
+```
+
+Callback 則把 `void *context` 轉回原本的型別：
+
+```c
+struct initramfs_info *info =
+    (struct initramfs_info *)context;
+```
+
+找到 `/chosen` 後，分別呼叫 `dtb_getprop()`：
+
+```c
+uint32_t start_len = 0;
+uint32_t end_len = 0;
+
+const uint8_t *start_value = dtb_getprop(
+    info->dtb, node_offset, "linux,initrd-start", &start_len);
+
+const uint8_t *end_value = dtb_getprop(
+    info->dtb, node_offset, "linux,initrd-end", &end_len);
+```
+
+**一定要分開檢查**，因為找到 Start 不代表 End 一定存在。
+
+### 9.1 依 Property Length 解碼地址
+
+`dtb_getprop()` 回傳的是原始 Bytes。`uint64_t` 是程式儲存地址的型別，**不代表 DTB 一定用了 8 bytes 儲存**。
+
+如果 `len == 4`（目前 Makefile 產生的格式）：
+
+```text
+Value: 08 00 00 00
+Size : 4 bytes
+Addr : 0x08000000
+```
+
+```c
+uint64_t addr = (uint64_t)dtb_read_be32(value);
+```
+
+如果 `len == 8`：
+
+```text
+Value: 00 00 00 00 08 00 00 00
+         high 32     low 32
+```
+
+```c
+uint64_t high = (uint64_t)dtb_read_be32(value);
+uint64_t low  = (uint64_t)dtb_read_be32(value + 4);
+uint64_t addr = (high << 32) | low;
+```
+
+需要**先轉型到 `uint64_t`，再左移 32 bits**，否則 32-bit 整數左移 32 bits 會產生 Undefined Behavior。對 `len == 4` 的資料也不能讀取 `value + 4`，因為那會超出該 Property 的範圍。
+
+### 9.2 為什麼用 `context` 傳結果？
+
+Callback 裡的 Local Variable 在 Function 返回後就不能當作結果保存。因此將解析後的地址寫入呼叫端提供的 Structure：
+
+```c
+info->start = initrd_start_addr;
+info->end = initrd_end_addr;
+info->found = 1;
+```
+
+`dtb_traverse()` 返回後，`kernel_main()` 就能透過同一份 `ramdisk_info` 使用 Start/End。
+
+> 更嚴謹的做法是在設定 `found = 1` 前檢查 `end > start`；目前的實作是在 Kernel 呼叫 CPIO Parser 前檢查此條件。
+
+---
+
+## 10. CPIO Parser：改成接收 Initramfs Pointer
+
+來源：[include/cpio.h](https://github.com/saiAnderson/oscapstone/blob/main/lab2/include/cpio.h)、[src/kernel/cpio.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/cpio.c)
+
+原本 CPIO Parser 自己決定從 `0x08000000` 開始解析；現在改為**由呼叫端提供 Archive 起始地址**：
+
+```c
+void cpio_list(void *archive_start);
+
+int cpio_find_file(
+    void *archive_start,
+    const char *target,
+    char **data,
+    unsigned int *size
+);
+```
+
+`cpio_find_file()` 裡面：
+
+```c
+struct cpio_newc_header *header =
+    (struct cpio_newc_header *)archive_start;
+```
+
+之後的 CPIO Header、Filename、File Data 和 Alignment 計算都沿用原本的 Parser，不需要重新設計 CPIO 格式。
+
+在 `kernel_main()`：
+
+```c
+if (!ramdisk_info.found || ramdisk_info.end <= ramdisk_info.start) {
+    uart_puts("Initramfs unavailable\r\n");
+} else if (cpio_find_file(
+    (void *)(uintptr_t)ramdisk_info.start,
+    "hello.txt",
+    &data,
+    &size
+)) {
+    for (unsigned int i = 0; i < size; i++) {
+        uart_send(data[i]);
+    }
+}
+```
+
+### 10.1 `uint64_t` Address 為什麼要轉成 Pointer？
+
+`ramdisk_info.start` 是整數型態的地址；`cpio_find_file()` 的第一個參數則是 `void *`。兩者概念不同：
+
+```text
+uint64_t 0x08000000      整數值
+       ↓ (uintptr_t)
+可表示 Pointer 的整數型別
+       ↓ (void *)
+(void *)0x08000000      指向 RAM 的 Pointer
+```
+
+因此使用：
+
+```c
+(void *)(uintptr_t)ramdisk_info.start
+```
+
+這個轉型**不會複製資料，也不會搬移 CPIO**；只是讓 Parser 知道應該從哪個記憶體位置開始讀取。在這個 AArch64 Bare-Metal 專案中，該地址由 QEMU 事先配置並載入資料。
+
+> **目前 Repo 的小細節：** `cpio.c` 頂部仍保留 `#define CPIO_ADD 0x08000000`，但 `cpio_list()` 和 `cpio_find_file()` 已不再引用它。代表解析路徑已移除 Hardcode **依賴**；若希望原始碼也完全沒有舊定義，可另行刪除該未使用的 Macro。
+
+---
+
+## 11. 實際驗證方式與結果
+
+### 11.1 確認原始 DTB 與新 DTB
+
+安裝工具：
+
+```bash
+sudo apt install device-tree-compiler
+```
+
+在 `lab2/` 下：
+
+```bash
+# 檢查原始 /chosen
+dtc -I dtb -O dts -o /tmp/oscapstone-original.dts bcm2710-rpi-3-b-plus.dtb
+grep -n -B 3 -A 20 'chosen' /tmp/oscapstone-original.dts
+
+# Makefile 自動產生新 DTB
+make build/initramfs.dtb
+
+# 讀取新 DTB 裡的兩個 Property
+fdtget -t x build/initramfs.dtb /chosen linux,initrd-start
+fdtget -t x build/initramfs.dtb /chosen linux,initrd-end
+
+# 確認 CPIO 真正大小
+stat -c%s initramfs.cpio
+```
+
+目前 Repository 的 `initramfs.cpio` 為 **1,024 bytes**，因此預期：
+
+```text
+linux,initrd-start = 0x08000000
+linux,initrd-end   = 0x08000400
+```
+
+`fdtget` 的輸出可能省略前導零與 `0x`，例如 `8000000`。
+
+### 11.2 確認 QEMU 使用新 DTB
+
+```bash
+make -n run | grep -- '-dtb'
+```
+
+應只出現：
+
+```text
+-dtb build/initramfs.dtb
+```
+
+### 11.3 Kernel 實際輸出
+
+依照本次在 QEMU / UART Bootloader 的測試紀錄，Kernel 成功取得：
+
+```text
+DTB magic: 0xD00DFEED
+Initramfs Start: 0x08000000
+Initramfs End: 0x08000400
+
+==================================
+TEST CPIO FIND
+Hello from initramfs!
+```
+
+這證明在目前測試環境中：
+
+- DTB 能正常被 Kernel 解析。
+- `/chosen` 的 Initramfs Start / End 能被查詢並解碼。
+- Callback 能透過 Context 將結果交回 `kernel_main()`。
+- CPIO Parser 能使用 DTB 提供的地址成功找到 `hello.txt`。
+
+---
+
+## 12. Debug 過程的重點與常見錯誤
+
+| 問題 | 原因 | 解法 |
+| --- | --- | --- |
+| `NULL undeclared` | 沒有提供 `NULL` 定義的 Header | `#include <stddef.h>` |
+| 查詢 `/chosen` 失敗 | `node_offset` 指向 `FDT_BEGIN_NODE`，尚未跳過 Token / Name / Padding | 從 `base + off_dt_struct + node_offset` 定位，跳過 Node Header 後再掃 Property |
+| 查到其他 Node 的 Property | Loop 沒有在 `FDT_END_NODE` 或 Child `FDT_BEGIN_NODE` 停止 | Property 查詢只限指定 Node 自身 |
+| 讀到 Property Name 而非 Value | 回傳 Strings Block Pointer | 回傳 `FDT_PROP` Header 後的 Value Pointer |
+| `linux,initrd-start not found` | 原始 DTB 本來就沒有該 Property | 產生包含 Start/End 的 `build/initramfs.dtb` |
+| QEMU 仍讀不到 | 重複寫了兩個 `-dtb`，或 `run` 沒有依賴新 DTB | 只保留 `-dtb $(DTB_INITRD)`，並加入 `$(DTB_INITRD)` Dependency |
+| 64-bit 地址解碼錯誤 | 沒先看 Property Length、或在 32-bit 型別上左移 32 | 依 `len == 4 / 8` 分支，轉型 `uint64_t` 後再位移 |
+| Callback 找到了，但 Kernel 用不到 | 地址只保存在 Callback 的 Local Variable | 透過 `context` 指向的 Structure 保存結果 |
+| Compiler 對整數傳 Pointer 警告 | `uint64_t` 與 `void *` 是不同型別 | 使用 `(void *)(uintptr_t)start` |
+
+---
+
+## 13. 完成範圍與限制
+
+### 已完成（本次 QEMU 練習）
+
+- FDT Header 與 Structure Block 的基本解析。
+- Node Traversal 與 Callback API。
+- `dtb_getprop()` 在指定 Node 中查詢 Property。
+- Makefile 建立帶有 Initramfs Start / End 的 DTB。
+- Bootloader 傳遞 DTB Pointer 到 Kernel。
+- Kernel 解碼 Big-Endian 地址並透過 Context 保存結果。
+- CPIO Parser 由呼叫端提供 `archive_start`，已驗證 `hello.txt` 內容可讀取。
+
+### 目前尚未實作的強化項目
+
+- `dtb_traverse()` 尚未使用 Callback 的 Return Value 做 Early Stop。
+- DTB Parser 假設輸入可信任，尚未對所有 Header Offset、String、Property Payload 做完整 Bounds Check。
+- CPIO Parser 尚未以 `initrd-end` 限制每次 Header 與 File Data 的讀取範圍；Kernel 目前只檢查 `end > start`。
+- 此流程是 QEMU + Makefile 在啟動前準備 DTB，**不是 Bootloader 動態修改 DTB**。
+- 尚未在實體 Raspberry Pi 3 上驗證。
+
+以上不影響本次測試的主要學習目標，但不等於完整、適合不可信輸入的 production-grade Parser。
+
+---
+
+## 14. 總結：從固定地址到可傳遞的開機資訊
+
+原本的設計：
+
+```text
+CPIO Parser → 寫死的 0x08000000
+```
+
+現在的設計：
+
+```text
+Makefile 決定載入位置及大小
+          ↓
+更新 DTB /chosen
+          ↓
+Bootloader 傳遞 DTB Pointer
+          ↓
+Kernel Traversal + Property Lookup
+          ↓
+取得 [start, end)
+          ↓
+cpio_find_file(archive_start, ...)
+```
+
+**本 Exercise 的核心不是把 CPIO 放進 DTB，而是建立「載入者提供開機資訊 → Kernel 解析 → 子系統使用」的責任分工。**
+
+### 參考程式碼
+
+- [Lab 2 Repository](https://github.com/saiAnderson/oscapstone/tree/main/lab2)
+- [Makefile](https://github.com/saiAnderson/oscapstone/blob/main/lab2/Makefile)
+- [DTB Parser：dtb.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/dtb.c)
+- [DTB API：dtb.h](https://github.com/saiAnderson/oscapstone/blob/main/lab2/include/dtb.h)
+- [Kernel / Callback：kernel.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/kernel.c)
+- [CPIO Parser：cpio.c](https://github.com/saiAnderson/oscapstone/blob/main/lab2/src/kernel/cpio.c)
+- [CPIO API：cpio.h](https://github.com/saiAnderson/oscapstone/blob/main/lab2/include/cpio.h)
